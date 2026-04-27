@@ -25,6 +25,8 @@ class ItemGenerator:
         return self.peek().pop(n)
 
 class FileConveyor(ItemGenerator):
+    SCALE_DIVISOR = 20
+
     def __init__(self, k=1, path='./input.txt'):
         super().__init__(k)
 
@@ -34,19 +36,72 @@ class FileConveyor(ItemGenerator):
         self._item_iter = None
 
         self.loaded = False
+
+        # Pallet normalization fields
+        self.pallet_size = None   # Original pallet dimensions from file
+        self.bin_size = None      # Normalized bin dimensions for the env
+        self.scale = None         # grid_units / real_units
+        self.inv_scale = None     # real_units / grid_units (for output)
+        self._parse_header()
+
+    def _parse_header(self):
+        """Parse pallet size from the first line and compute uniform normalization scale.
         
+        The first line should contain three numbers (L W H) representing the
+        pallet dimensions.  All item dimensions are then scaled by
+        GRID_SIZE / max(L, W, H) so that proportions are preserved and
+        the largest pallet axis maps to GRID_SIZE.
+        """
+        with open(self.path, 'r') as file:
+            first_line = file.readline().strip()
+
+        dims = first_line.split()
+        if len(dims) == 3:
+            try:
+                pw, pd, ph = map(float, dims)  # input order: W D H
+                self.pallet_size = (pw, ph, pd)
+                self.scale = 1.0 / self.SCALE_DIVISOR
+                self.inv_scale = self.SCALE_DIVISOR
+                self.bin_size = (
+                    max(1, int(round(pw * self.scale))),
+                    max(1, int(round(ph * self.scale))),
+                    max(1, int(round(pd * self.scale))),
+                )
+            except ValueError:
+                pass  # Not a valid pallet header.  fall back to legacy format
+
     def _iter(self):
         with open(self.path, 'r') as file:
-            for line in file.readlines():
-                w, h, d = map(int, line.split(' '))
-                yield w, h, d
+            lines = file.readlines()
+
+        # If a pallet header was parsed, skip the first line + blank line
+        start = 2 if self.pallet_size is not None else 0
+
+        items = []
+        for line in lines[start:]:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            w, h, d = map(float, parts[:3])
+
+            if self.scale is not None:
+                # Normalize to grid scale, minimum 1 to avoid zero-size items
+                w = max(1, int(round(w * self.scale)))
+                h = max(1, int(round(h * self.scale)))
+                d = max(1, int(round(d * self.scale)))
+            else:
+                w, h, d = int(w), int(h), int(d)
+
+            items.append((w, h, d))
+
+        np.random.shuffle(items)
+        yield from items
         
     def reset(self):
-        if not self.loaded:
-            self.loaded = True
-            self.buffer = []
-            self._items = []
-            self._item_iter = self._iter()
+        self.buffer = []
+        self._items = []
+        self._item_iter = self._iter()
         return self
 
 class InputConveyor(ItemGenerator):
@@ -151,7 +206,7 @@ class Conveyor(ItemGenerator):
     
 def rotated_sizes(item, rotate=True, remove_duplicate=True):
     if rotate is True:
-        rotate = 'xyz'
+        rotate = 'y'
     elif rotate is False:
         rotate = ''
     
@@ -161,6 +216,8 @@ def rotated_sizes(item, rotate=True, remove_duplicate=True):
         sizes.extend((w, d, h) for w, h, d in sizes[:])
     if 'y' in rotate:
         sizes.extend((d, h, w) for w, h, d in sizes[:])
+    
+    #Removed Z rotation due to hardware limitations.
     if 'z' in rotate:
         sizes.extend((h, w, d) for w, h, d in sizes[:])
             

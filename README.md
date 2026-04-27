@@ -1,7 +1,8 @@
 # DeepPack3D
 **DeepPack3D** is a Python-based 3D bin-packing software optimized for robotic palletization systems. It supports various methods, including reinforcement learning (RL) and heuristic baselines, and provides flexible options for data input and visualization.
 
-<img src="./outputs/0_0_0.jpg" width="200"><img src="./outputs/0_1_0.jpg" width="200"><img src="./outputs/0_44_0.jpg" width="200">
+<img src="./outputs/bin0/0_0.jpg" width="200"><img src="./outputs/bin0/1_0.jpg" width="200">
+<img src="./outputs/bin0/10_0.jpg" width="200"><img src="./outputs/bin0/69_0.jpg" width="200">
 
 ## Features
 - Supports multiple methods: Reinforcement Learning (**RL**), Best Lookahead (**BL**), Best Area Fit (**BAF**), Best Shortest Side Fit (**BSSF**), and Best Longest Side Fit (**BLSF**).
