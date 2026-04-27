@@ -225,7 +225,7 @@ class MultiBinPackerEnv(Env):
         return xyz
 
 
-    def placeable_coords(self, packer, h_map, size):
+    def placeable_coords2(self, packer, h_map, size):
         w, h, d = size
         w_pad, h_pad, d_pad = w + self.h_pad, h + self.v_pad, d + self.h_pad
         padded_size = (w_pad, h_pad, d_pad)
