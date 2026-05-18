@@ -1,4 +1,7 @@
 import os
+import concurrent.futures
+import queue
+import subprocess
 
 import numpy as np
 
@@ -11,6 +14,144 @@ import json
 from env import *
 import collections, itertools
 
+class UnityEvaluator:
+    """Runs Unity headless physics sim in background threads.
+    Submit placements at episode end; drain results each episode to inject into replay buffer."""
+
+    def __init__(self, exe_path, max_parallel=1, timeout=600, reward_scale=10.0, placements_dir='./unity_sims'):
+        """
+        exe_path:      path to PackingSim_Linux.x86_64
+        max_parallel:  simultaneous Unity processes (each is heavy; 1-2 recommended)
+        timeout:       per-sim hard cap in seconds
+        reward_scale:  magnitude of unity reward (matched to existing terminal reward scale)
+        placements_dir: directory for per-episode input/output files (avoids conflicts)
+        """
+        self.exe_path = exe_path
+        self.timeout = timeout
+        self.reward_scale = reward_scale
+        self.placements_dir = placements_dir
+        os.makedirs(placements_dir, exist_ok=True)
+        self._result_queue = queue.Queue()
+        self._log_queue = queue.Queue()  # separate copy for external logging
+        self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel)
+
+    def submit(self, placements, all_buf_indices, episode_id):
+        """Non-blocking. Launches Unity sim in a background thread.
+        all_buf_indices: list of (buf_idx, slot_ver) for every transition in the episode,
+        in step order, so per-step stability rewards can be credited to the right transitions."""
+        self._pool.submit(self._run, list(placements), all_buf_indices, episode_id)
+
+    def _run(self, placements, all_buf_indices, episode_id):
+        agg_reward = 0.0
+        per_step_rewards = []
+        inp = os.path.join(self.placements_dir, f'placements_ep{episode_id}.jsonl')
+        out = os.path.join(self.placements_dir, f'stability_ep{episode_id}.json')
+        try:
+            with open(inp, 'w') as f:
+                for p in placements:
+                    f.write(json.dumps(p) + '\n')
+            proc = subprocess.run(
+                [self.exe_path, '-batchmode', '-nographics', '-headlessEval',
+                 '-input', inp, '-output', out],
+                capture_output=True, timeout=self.timeout
+            )
+            if proc.returncode == 0 and os.path.exists(out):
+                with open(out) as f:
+                    data = json.load(f)
+                agg_reward, per_step_rewards = self._parse(data)
+            else:
+                stderr = proc.stderr.decode('utf-8', errors='replace')[:500]
+                print(f'[Unity] ep {episode_id}: sim failed (rc={proc.returncode}): {stderr}')
+        except subprocess.TimeoutExpired:
+            print(f'[Unity] ep {episode_id}: timed out after {self.timeout}s')
+        except Exception as e:
+            print(f'[Unity] ep {episode_id}: error: {e}')
+
+        self._result_queue.put((episode_id, per_step_rewards, all_buf_indices))
+        self._log_queue.put((episode_id, agg_reward))
+
+    def _parse(self, result):
+        """Compute per-step stability rewards using a composite score.
+
+        Composite score per step combines three signals:
+          - Tilt score:     continuous tilt angle normalized to [0,1] (0 deg=1.0, 45+ deg=0.0)
+          - Discrete score: fraction of stable boxes, counting wobbling at half-weight
+          - Motion score:   penalises linear speed and recent drift (impending instability)
+
+        Per-step reward = clip(composite[i] - composite[i-1], min=-1, max=0) * reward_scale
+        Only stability *drops* are penalised; recoveries are not rewarded, avoiding false
+        credit to the placement that happened to land after a pile settled.
+
+        Returns (agg_reward, per_step_rewards):
+          agg_reward       -- scalar based on final_stability_score, used for logging
+          per_step_rewards -- list aligned to placement steps (length == num steps in sim)
+        """
+        steps = result.get('steps', [])
+        agg_score = float(result.get('final_stability_score', 0.5))
+        agg_reward = self.reward_scale * (agg_score - 0.8)
+
+        if not steps:
+            return agg_reward, [agg_reward]
+
+        per_step_rewards = []
+        prev_composite = 1.0  # perfect stability before any boxes are placed
+
+        for step in steps:
+            n = max(step.get('num_boxes', 1), 1)
+
+            # 1. Continuous tilt angle: 0 deg -> 1.0, 45+ deg -> 0.0
+            mean_tilt = step.get('mean_tilt_angle_degrees', 0.0)
+            tilt_score = max(0.0, 1.0 - mean_tilt / 45.0)
+
+            # 2. Discrete fraction: tipped boxes count fully, wobbling boxes count as half
+            n_tipped = step.get('num_tipped_boxes', 0)
+            n_wobbling = step.get('num_wobbling_boxes', 0)
+            discrete_score = 1.0 - (n_tipped + 0.5 * n_wobbling) / n
+
+            # 3. Motion score: high linear speed or drift signals impending collapse
+            linear_speed = step.get('mean_linear_speed', 0.0)
+            drift = step.get('mean_recent_drift', 0.0)
+            motion_score = max(0.0, 1.0 - linear_speed / 0.05 - drift / 0.02)
+
+            composite = 0.4 * tilt_score + 0.4 * discrete_score + 0.2 * motion_score
+
+            # Delta: how much did THIS placement harm stability?
+            # Clip positive deltas to 0 so recoveries don't reward the wrong step.
+            delta = composite - prev_composite
+            step_reward = self.reward_scale * min(delta, 0.0)
+
+            per_step_rewards.append(step_reward)
+            prev_composite = composite
+
+        return agg_reward, per_step_rewards
+
+    def drain(self):
+        """Collect all finished results without blocking.
+        Returns list of (episode_id, per_step_rewards, all_buf_indices)."""
+        results = []
+        while True:
+            try:
+                results.append(self._result_queue.get_nowait())
+            except queue.Empty:
+                break
+        return results
+
+    def drain_log(self):
+        """Collect completed (episode_id, unity_reward) pairs for external logging.
+        Independent of drain() — consuming one does not affect the other."""
+        results = []
+        while True:
+            try:
+                results.append(self._log_queue.get_nowait())
+            except queue.Empty:
+                break
+        return results
+
+    def shutdown(self, wait=True):
+        """Shut down thread pool. Pass wait=False to abandon in-flight sims."""
+        self._pool.shutdown(wait=wait, cancel_futures=not wait)
+
+
 class PrioritizedReplayBuffer:
     """Prioritized Experience Replay buffer using sum-tree for O(log n) sampling."""
     def __init__(self, maxlen=1000000, alpha=0.6):
@@ -18,6 +159,7 @@ class PrioritizedReplayBuffer:
         self.alpha = alpha  # priority exponent: 0 = uniform, 1 = full prioritization
         self.buffer = []
         self.priorities = np.zeros(maxlen, dtype=np.float64)
+        self._slot_version = np.zeros(maxlen, dtype=np.int64)  # increments each time a slot is overwritten
         self.pos = 0
         self.size = 0
 
@@ -29,6 +171,7 @@ class PrioritizedReplayBuffer:
         for t in transitions:
             self.buffer.append(t) if self.size < self.maxlen else self.buffer.__setitem__(self.pos, t)
             self.priorities[self.pos] = max_priority
+            self._slot_version[self.pos] += 1
             self.pos = (self.pos + 1) % self.maxlen
             self.size = min(self.size + 1, self.maxlen)
 
@@ -360,13 +503,36 @@ class Agent:
         
         return loss, td_errors.numpy().flatten()
     
-    def run(self, max_ep=1, verbose=False, train=None):
+    def run(self, max_ep=1, verbose=False, train=None, unity_evaluator=None):
         if train is None:
             train = self.__train
             
         iters = (i for i, _ in enumerate(iter(bool, True))) if max_ep == -1 else range(max_ep)
 
         for ep in iters:
+            # === DRAIN COMPLETED UNITY RESULTS ===
+            # Patch the terminal transition already in the replay buffer:
+            # add the Unity stability reward directly to its n-step return and
+            # boost its priority so it gets resampled soon.
+            if unity_evaluator is not None and train and self.memory is not None:
+                for ep_id, per_step_rewards, all_buf_indices in unity_evaluator.drain():
+                    # Distribute per-step stability rewards to each placement's transition.
+                    # Only steps where stability dropped (step_reward < 0) get patched,
+                    # giving the model precise credit assignment instead of blaming the terminal.
+                    patched = 0
+                    max_pri = self.memory.priorities[:self.memory.size].max() if self.memory.size > 0 else 1.0
+                    for k, (buf_idx, slot_ver) in enumerate(all_buf_indices):
+                        step_reward = per_step_rewards[k] if k < len(per_step_rewards) else 0.0
+                        if step_reward == 0.0:
+                            continue  # neutral steps don't need patching
+                        if buf_idx < self.memory.size and self.memory._slot_version[buf_idx] == slot_ver:
+                            ci, ns_ret, r, d = self.memory.buffer[buf_idx]
+                            self.memory.buffer[buf_idx] = (ci, ns_ret + step_reward, r + step_reward, d)
+                            # Boost priority so destabilising placements are resampled soon
+                            self.memory.priorities[buf_idx] = max_pri
+                            patched += 1
+                    print(f'[Unity] ep {ep_id}: patched {patched}/{len(all_buf_indices)} transitions with per-step stability rewards')
+
             if verbose:
                 print(f'ep {ep}:')
                 
@@ -375,6 +541,7 @@ class Agent:
             items_packed = 0
             
             history = []
+            ep_placements = []  # placements accumulated for Unity eval
             
             for step in itertools.count():
                 if verbose:
@@ -394,6 +561,16 @@ class Agent:
                 items_packed += 1
                 
                 next_state, reward, done = self.env.step(action)
+
+                # Track placement for Unity physics eval
+                if unity_evaluator is not None:
+                    bin_index, (px, py, pz), (pw, ph, pd), _ = actions[action[0]][action[1]][action[2]]
+                    s = 1
+                    ep_placements.append({
+                        'bin': int(bin_index),
+                        'x': round(float(px * s), 3), 'y': round(float(py * s), 3), 'z': round(float(pz * s), 3),
+                        'w': round(float(pw * s), 3), 'h': round(float(ph * s), 3), 'd': round(float(pd * s), 3),
+                    })
                 
                 if train:
                     # Store compact NN inputs instead of full states (~17KB vs ~589KB per transition)
@@ -415,7 +592,6 @@ class Agent:
                         with open(f"./outputs/bin{ep}/placements.jsonl", "a") as f:
                             placement = actions[action[0]][action[1]][action[2]]
                             bin_index, (x, y, z), (w, h, d), split = placement
-                            # Convert grid coords back to real-world units
                             s = 1#getattr(self.env, 'inv_scale', 1.0)
                             f.write(json.dumps({
                                 "bin": int(bin_index),
@@ -454,6 +630,23 @@ class Agent:
                     n_step_returns[t] = G
                 transitions = [(ci, ns_ret, r, d) for (ci, r, d), ns_ret in zip(history, n_step_returns)]
                 self.memory.extend(transitions)
+                # Record (buf_idx, slot_version) for every transition in this episode so that
+                # per-step stability rewards can be credited to the exact right buffer slot.
+                ep_len = len(transitions)
+                all_buf_indices = [
+                    (
+                        (self.memory.pos - ep_len + k) % self.memory.maxlen,
+                        self.memory._slot_version[(self.memory.pos - ep_len + k) % self.memory.maxlen],
+                    )
+                    for k in range(ep_len)
+                ]
+
+                # Submit Unity eval AFTER committing to buffer (non-blocking, ~4 min in background)
+                # When it finishes, per-step stability rewards are distributed to each transition.
+                if unity_evaluator is not None and ep_placements:
+                    unity_evaluator.submit(ep_placements, all_buf_indices, ep)
+                    print(f'[Unity] ep {ep}: submitted {len(ep_placements)} placements for physics eval')
+
                 if len(self.memory) > 1000:
                     # Train multiple times per episode, proportional to new data collected
                     # Standard DQN does ~1 gradient step per 4 env steps
