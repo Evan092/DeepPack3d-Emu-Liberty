@@ -57,6 +57,10 @@ def parse_args():
                         action='store_true', 
                         help='enable visualization mode (default: False).')
     
+    parser.add_argument('--unity', metavar='', 
+                        type=str, default=None, 
+                        help='path to PackingSim_Linux.x86_64 for physics eval (default: None).')
+    
     return parser.parse_args()
 
 import numpy as np
@@ -72,7 +76,7 @@ heuristics = {
     'blsf': best_long_side_fit, 
 }
 
-def deeppack3d(method, lookahead, *, n_iterations=100, seed=None, verbose=1, data='generated', path=None, train=False, visualize=False, batch_size=32):
+def deeppack3d(method, lookahead, *, n_iterations=100, seed=None, verbose=1, data='generated', path=None, train=False, visualize=False, batch_size=32, unity_exe=None):
     reset_rng(seed)
     
     env = MultiBinPackerEnv(n_bins=1, 
@@ -136,15 +140,36 @@ def deeppack3d(method, lookahead, *, n_iterations=100, seed=None, verbose=1, dat
             agent.eps = 0.025  # or load from a saved epsilon value
         else:
             agent.eps = 1.0
+        # Initialize Unity evaluator if exe path provided
+        unity_evaluator = None
+        if unity_exe is not None:
+            unity_evaluator = UnityEvaluator(
+                exe_path=unity_exe,
+                placements_dir='./unity_sims',
+                max_parallel=6,
+                timeout=600,
+                reward_scale=100.0,
+            )
+            print(f'Unity physics eval enabled: {unity_exe}')
+
         # Initialize lists to store episode data
         episode_data = []
         iteration_data = []
+        stability_data = []
         
         for i in range(1, n_iterations):
             print(f'Iteration {i}')
             start_time = time.time()
             
-            yield from agent.run(100, verbose=verbose > 1)
+            yield from agent.run(100, verbose=verbose > 1, unity_evaluator=unity_evaluator, ep_offset=(i - 1) * 100)
+
+            # Wait for any Unity sims still running at the end of the iteration,
+            # then apply their stability rewards to the replay buffer before logging.
+            if unity_evaluator is not None:
+                print(f'Waiting for remaining Unity sims...')
+                unity_evaluator.wait_all()
+                agent.apply_unity_results(unity_evaluator)
+
             #agent.eps = max(agent.eps * 0.95, 0.025)
             agent.eps = max(agent.eps * 0.975, 0.025)
             
@@ -161,6 +186,18 @@ def deeppack3d(method, lookahead, *, n_iterations=100, seed=None, verbose=1, dat
                         'n_bins': n_bins
                     })
             
+            # Collect any Unity stability results that finished this iteration
+            if unity_evaluator is not None:
+                for ep_id, unity_reward in unity_evaluator.drain_log():
+                    stability_score = (unity_reward / unity_evaluator.reward_scale) + 0.8
+                    stability_data.append({
+                        'iteration': ep_id // 100 + 1,
+                        'episode': ep_id % 100,
+                        'global_episode': ep_id,
+                        'unity_reward': round(unity_reward, 4),
+                        'stability_score': round(stability_score, 4),
+                    })
+
             # Calculate iteration averages
             recent_episodes = agent.ep_history[-100:]
             utils_flat = [util for utils, n_bins, ep_reward, items_packed in recent_episodes for util in utils]
@@ -190,6 +227,11 @@ def deeppack3d(method, lookahead, *, n_iterations=100, seed=None, verbose=1, dat
                 # Save iteration data
                 iterations_df = pd.DataFrame(iteration_data)
                 iterations_df.to_excel('./training_iterations.xlsx', index=False)
+
+                # Save Unity stability data
+                if stability_data:
+                    stability_df = pd.DataFrame(stability_data)
+                    stability_df.to_excel('./training_stability.xlsx', index=False)
                 
                 print(f'Data saved after iteration {i}')
             
@@ -203,6 +245,9 @@ def deeppack3d(method, lookahead, *, n_iterations=100, seed=None, verbose=1, dat
             
             print(f'Iteration {i} completed in {time.time() - start_time:.2f} seconds, Avg Util: {np.mean(utils_flat)*100:.2f}%, Avg Items: {np.mean(items_packed_list):.2f}')
             
+        if unity_evaluator is not None:
+            unity_evaluator.shutdown(wait=True)
+
         data = np.asarray([utils for utils, n_bins, ep_reward, items_packed in agent.ep_history])
             
         data = np.asarray([utils for utils, n_bins, ep_reward, items_packed in agent.ep_history])
@@ -273,7 +318,8 @@ def main():
                         data=args.data, 
                         path=args.path,
                         visualize=args.visualize, 
-                        batch_size=args.batch_size):
+                        batch_size=args.batch_size,
+                        unity_exe=args.unity):
         pass
 
 if __name__ == "__main__":

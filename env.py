@@ -3,7 +3,7 @@ from conveyor import *
 from SpacePartitioner import *
 from geometry import *
 from binpacker import *
-
+import math
 
 class Env:
     def __init__(self, verbose):
@@ -140,7 +140,7 @@ class MultiBinPackerEnv(Env):
         
         return u_maps
     
-    def placeable_coords(self, packer, h_map, size):
+    def placeable_coords_old(self, packer, h_map, size):
         w, h, d = size
         w_pad = w + self.h_pad
         h_pad = h + self.v_pad
@@ -225,7 +225,7 @@ class MultiBinPackerEnv(Env):
         return xyz
 
 
-    def placeable_coords2(self, packer, h_map, size):
+    def placeable_coords(self, packer, h_map, size):
         w, h, d = size
         w_pad, h_pad, d_pad = w + self.h_pad, h + self.v_pad, d + self.h_pad
         padded_size = (w_pad, h_pad, d_pad)

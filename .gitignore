@@ -25,6 +25,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+unity_sims/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -156,17 +157,17 @@ cython_debug/
 
 # Output data
 outputs/*
-!outputs/bin0/
 
 #Proprietary files
 input.txt
+
+*__MACOSX*
 
 $ Local only files
 .vscode/*
 Exampleinput.txt
 *.pkl
-
-
+*.h5
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
