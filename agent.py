@@ -80,9 +80,10 @@ class UnityEvaluator:
           - Discrete score: fraction of stable boxes, counting wobbling at half-weight
           - Motion score:   penalises linear speed and recent drift (impending instability)
 
-        Per-step reward = clip(composite[i] - composite[i-1], min=-1, max=0) * reward_scale
-        Only stability *drops* are penalised; recoveries are not rewarded, avoiding false
-        credit to the placement that happened to land after a pile settled.
+        Per-step reward penalizes every state that remains below the best composite
+        stability previously observed in the episode. This keeps stable trajectories
+        neutral while making persistent wobble or drift costly even without a new
+        adjacent-step drop. Recoveries are never rewarded.
 
         Returns (agg_reward, per_step_rewards):
           agg_reward       -- scalar based on final_stability_score, used for logging
@@ -96,7 +97,7 @@ class UnityEvaluator:
             return agg_reward, [agg_reward]
 
         per_step_rewards = []
-        prev_composite = 1.0  # perfect stability before any boxes are placed
+        best_composite = 1.0  # perfect stability before any boxes are placed
 
         for step in steps:
             n = max(step.get('num_boxes', 1), 1)
@@ -117,13 +118,15 @@ class UnityEvaluator:
 
             composite = 0.4 * tilt_score + 0.4 * discrete_score + 0.2 * motion_score
 
-            # Delta: how much did THIS placement harm stability?
-            # Clip positive deltas to 0 so recoveries don't reward the wrong step.
-            delta = composite - prev_composite
-            step_reward = self.reward_scale * min(delta, 0.0)
+            # A degraded state stays penalized until the packing returns to the
+            # best stability previously achieved. The current item receives this
+            # penalty directly; Agent.apply_unity_results() also credits the few
+            # immediately preceding structural placements with a discounted share.
+            degradation = composite - best_composite
+            step_reward = self.reward_scale * min(degradation, 0.0)
 
             per_step_rewards.append(step_reward)
-            prev_composite = composite
+            best_composite = max(best_composite, composite)
 
         return agg_reward, per_step_rewards
 
@@ -162,7 +165,7 @@ class UnityEvaluator:
 
 
 class PrioritizedReplayBuffer:
-    """Prioritized Experience Replay buffer using sum-tree for O(log n) sampling."""
+    """Prioritized Experience Replay buffer."""
     def __init__(self, maxlen=1000000, alpha=0.6):
         self.maxlen = maxlen
         self.alpha = alpha  # priority exponent: 0 = uniform, 1 = full prioritization
@@ -227,15 +230,15 @@ def q_net(k=1):
     hmap_in = Input((32, 32, 1))
     amap_in = Input((32, 32, 1))
     umap_in = Input((32, 32, 1))  # utilization map: fill density below surface
+    boundary_in = Input((32, 32, 1))  # seam-aware boundary map for interweaving
     imap_in = Input((k, 3))
     imap_x = Flatten()(imap_in)
-    const_in = Input((32, 32, 1))
     # Explicit placement scalars: (x/W, y/H, z/D, w/W, h/H, d/D)
     # These bypass GlobalAveragePooling entirely, giving the network a direct,
     # undiluted signal about WHERE and HOW HIGH the item is placed.
     placement_in = Input((6,))
     
-    x = concatenate([hmap_in, amap_in, umap_in, const_in], axis=-1)
+    x = concatenate([hmap_in, amap_in, umap_in, boundary_in], axis=-1)
     
     x = Conv2D(64, 11, strides=1, activation='relu', kernel_regularizer=l2(weight_decay), kernel_initializer='he_uniform')(x)
     x = BatchNormalization()(x)
@@ -265,7 +268,7 @@ def q_net(k=1):
     x = Dense(1, activation='linear')(x)
     
     outputs = x
-    model = Model([const_in, hmap_in, amap_in, umap_in, imap_in, placement_in], outputs)
+    model = Model([boundary_in, hmap_in, amap_in, umap_in, imap_in, placement_in], outputs)
     return model
 
 class Agent:
@@ -289,6 +292,11 @@ class Agent:
         self.update_epochs = 10
 
         self.n_step = 12  # n-step return horizon
+        # A Unity instability event can arise from the immediately preceding
+        # foundation choices. Keep credit assignment local to avoid attributing
+        # every later wobble to the entire packing trajectory.
+        self.unity_backprop_steps = 4
+        self.unity_backprop_discount = 0.85
 
         self.batch_size = batch_size
         
@@ -296,13 +304,17 @@ class Agent:
 
         self.verbose = verbose
         self.visualize = visualize
+
+        # Phase 0 diagnostic: last argmax-Q vector + its action space (None when exploring)
+        self._last_q = None
+        self._last_action_space = None
         
         if self.__train:
             self.q_net = q_net(k=env.k - 1)
             self.q_net_target = q_net(k=env.k - 1)
             # Initialize target network with same weights as online network
             self.q_net_target.set_weights(self.q_net.get_weights())
-            self.q_optimizer = tf.keras.optimizers.Adam(learning_rate=self.warmup_lr)
+            self.q_optimizer = tf.keras.optimizers.Adam(learning_rate=self.warmup_lr, global_clipnorm=1.0)
             self.memory = PrioritizedReplayBuffer(maxlen=200000, alpha=0.6)
             self.per_beta = 0.4        # IS correction exponent, annealed toward 1
             self.per_beta_max = 1.0
@@ -314,7 +326,7 @@ class Agent:
             self.memory = None
     
     def select(self, state):
-        items, h_maps, u_maps, actions = state
+        items, h_maps, u_maps, boundary_maps, actions = state
         action_space = indices(actions)
         
 #         print('actions: ', len(action_space))
@@ -331,12 +343,67 @@ class Agent:
             else:
                 action = action_space[np.random.choice(len(action_space))]
             r = 0
+            self._last_q = None  # exploration step: no argmax ranking to diagnose
+            self._last_action_space = None
         else:
             q = self.Q(state)
             action = action_space[np.argmax(q)]
             r = np.max(q)
+            self._last_q = np.asarray(q).reshape(-1)
+            self._last_action_space = action_space
             
         return action, r, r != 0
+
+    def _placement_choice_record(self, step, state, actual_reward):
+        # Phase 0 diagnostic: compare the argmax-Q pick against the best-supported
+        # candidate to tell whether Q mis-ranks well-supported placements.
+        q = self._last_q
+        action_space = self._last_action_space
+        if q is None or action_space is None or len(action_space) == 0:
+            return None
+
+        _, h_maps, _, _, actions = state
+
+        def describe(m):
+            i, j, k = action_space[m]
+            bin_index, (x, y, z), (w, h, d), _ = actions[i][j][k]
+            total = float(w * d)
+            footprint = h_maps[bin_index][int(z):int(z + d), int(x):int(x + w)]
+            support = float(np.count_nonzero(footprint == y)) / total if total > 0 else 1.0
+            return bin_index, (x, y, z), (w, h, d), support
+
+        # Rank of each candidate by Q (0 = highest Q)
+        rank_of = {int(idx): r for r, idx in enumerate(np.argsort(-q))}
+
+        supports = [(m,) + describe(m) for m in range(len(action_space))]
+        chosen_idx = int(np.argmax(q))
+        chosen = supports[chosen_idx]
+        # Best support; break ties toward the higher-Q candidate.
+        best = max(supports, key=lambda t: (t[4], q[t[0]]))
+
+        def entry(t, include_reward=False):
+            m, bin_index, (x, y, z), (w, h, d), support = t
+            e = {
+                "q": round(float(q[m]), 4),
+                "q_rank": int(rank_of[m]),
+                "support": round(support, 4),
+                "overhang": round(1.0 - support, 4),
+                "x": round(float(x), 3), "y": round(float(y), 3), "z": round(float(z), 3),
+                "w": round(float(w), 3), "h": round(float(h), 3), "d": round(float(d), 3),
+            }
+            if include_reward:
+                e["reward"] = round(float(actual_reward), 4)
+            return e
+
+        return {
+            "step": step,
+            "bin": int(chosen[1]),
+            "num_candidates": len(action_space),
+            "chosen": entry(chosen, include_reward=True),
+            "best_support": entry(best),
+            "chosen_is_best_support": bool(chosen[0] == best[0]),
+            "max_support_available": round(float(max(t[4] for t in supports)), 4),
+        }
     
     def save_memory(self, path):
         """Save replay buffer to disk (atomic write to avoid corruption on crash)"""
@@ -387,7 +454,7 @@ class Agent:
     def Q_inputs(self, state, action=None):
         W, H, D = self.env.size
         
-        items, h_maps, u_maps, actions = state
+        items, h_maps, u_maps, boundary_maps, actions = state
         if action is None:
             action_space = indices(actions)
         else:
@@ -399,6 +466,7 @@ class Agent:
         hmap_in = []
         amap_in = []
         umap_in = []
+        boundary_in = []
         imap_in = []
         placement_in = []
         
@@ -414,30 +482,35 @@ class Agent:
             # Utilization map: fill density below surface
             umap = u_maps[j]
 
+            # Boundary map: seam-aware mask of visible top-layer edges
+            boundary = boundary_maps[j]
+
             # Resize to 32x32 for neural net
             amap = self._resize_map(amap)
             hmap = self._resize_map(hmap)
             umap = self._resize_map(umap)
+            boundary = self._resize_map(boundary)
 
             imap = imaps[j][np.arange(len(items)) != i]
 
             hmap_in.append(hmap)
             amap_in.append(amap)
             umap_in.append(umap)
+            boundary_in.append(boundary)
             imap_in.append(imap)
             # Explicit placement scalars bypass GlobalAveragePooling dilution.
             # The item footprint is ~2-4% of the 32x32 map; after GAP the height
             # signal at the footprint is drowned out by the other 96-98% of pixels.
             placement_in.append([x / W, y / H, z / D, w / W, h / H, d / D])
             
-        hmap_in, amap_in, umap_in, imap_in = map(np.asarray, (hmap_in, amap_in, umap_in, imap_in))
+        hmap_in, amap_in, umap_in, boundary_in, imap_in = map(np.asarray, (hmap_in, amap_in, umap_in, boundary_in, imap_in))
         hmap_in = hmap_in[..., None]
         amap_in = amap_in[..., None]
         umap_in = umap_in[..., None]
-        const_in = np.ones(hmap_in.shape, dtype=np.float32)
+        boundary_in = boundary_in[..., None]
         placement_in = np.array(placement_in, dtype=np.float32)
         
-        return [const_in, hmap_in, amap_in, umap_in, imap_in, placement_in]
+        return [boundary_in, hmap_in, amap_in, umap_in, imap_in, placement_in]
     
     def Q(self, state, action=None, net=None):
         if net is None:
@@ -514,24 +587,86 @@ class Agent:
     
     def apply_unity_results(self, unity_evaluator):
         """Drain completed Unity results and patch the replay buffer in-place.
-        Safe to call at any time: processes whatever has finished so far."""
+        Safe to call at any time: processes whatever has finished so far.
+
+        Unity evaluates an entire episode after its transitions have entered replay.
+        A negative physics signal is therefore assigned to the placement where it
+        appears plus the preceding few structural placements. Every replay write is
+        guarded by the episode's captured slot version, so overwritten slots are
+        skipped rather than patched incorrectly.
+        """
         if self.memory is None:
             return
         for ep_id, per_step_rewards, all_buf_indices in unity_evaluator.drain():
-            patched = 0
             max_pri = self.memory.priorities[:self.memory.size].max() if self.memory.size > 0 else 1.0
-            for k, (buf_idx, slot_ver) in enumerate(all_buf_indices):
-                step_reward = per_step_rewards[k] if k < len(per_step_rewards) else 0.0
-                if step_reward == 0.0:
-                    continue  # neutral steps don't need patching
-                if buf_idx < self.memory.size and self.memory._slot_version[buf_idx] == slot_ver:
-                    ci, ns_ret, r, d = self.memory.buffer[buf_idx]
-                    self.memory.buffer[buf_idx] = (ci, ns_ret + step_reward, r + step_reward, d)
-                    self.memory.priorities[buf_idx] = max_pri
-                    patched += 1
-            print(f'[Unity] ep {ep_id}: patched {patched}/{len(all_buf_indices)} transitions with per-step stability rewards')
+            episode_len = len(all_buf_indices)
+            adjustments = np.zeros(episode_len, dtype=np.float64)
+            direct_penalties = 0
 
-    def run(self, max_ep=1, verbose=False, train=None, unity_evaluator=None, ep_offset=0):
+            # Aggregate first so overlapping backward windows update each immediate
+            # reward once and n-step returns can be recomputed from final values.
+            for k, step_reward in enumerate(per_step_rewards[:episode_len]):
+                if step_reward >= 0.0:
+                    continue
+                direct_penalties += 1
+                first_cause = max(0, k - self.unity_backprop_steps)
+                for t in range(first_cause, k + 1):
+                    distance = k - t
+                    adjustments[t] += step_reward * (self.unity_backprop_discount ** distance)
+
+            if not np.any(adjustments):
+                print(f'[Unity] ep {ep_id}: no stability penalties to patch')
+                continue
+
+            slot_is_current = np.array([
+                buf_idx < self.memory.size and self.memory._slot_version[buf_idx] == slot_ver
+                for buf_idx, slot_ver in all_buf_indices
+            ], dtype=bool)
+            stale_skips = int(np.count_nonzero(~slot_is_current & (adjustments != 0.0)))
+            immediate_patches = 0
+
+            for t, adjustment in enumerate(adjustments):
+                if adjustment == 0.0 or not slot_is_current[t]:
+                    continue
+                buf_idx, _ = all_buf_indices[t]
+                ci, ns_ret, reward, done = self.memory.buffer[buf_idx]
+                self.memory.buffer[buf_idx] = (ci, ns_ret, reward + float(adjustment), done)
+                self.memory.priorities[buf_idx] = max_pri
+                immediate_patches += 1
+
+            # A late reward correction changes every n-step return whose reward
+            # window includes that transition. Recompute only valid contiguous
+            # episode windows; stale replay slots may now belong to another episode.
+            affected_returns = set()
+            for adjusted_step in np.flatnonzero(adjustments):
+                first_return = max(0, adjusted_step - self.n_step + 1)
+                affected_returns.update(range(first_return, adjusted_step + 1))
+
+            return_patches = 0
+            for start in affected_returns:
+                stop = min(start + self.n_step, episode_len)
+                if not np.all(slot_is_current[start:stop]):
+                    continue
+                n_step_return = 0.0
+                for offset, t in enumerate(range(start, stop)):
+                    buf_idx, _ = all_buf_indices[t]
+                    n_step_return += (self.gamma ** offset) * self.memory.buffer[buf_idx][2]
+
+                buf_idx, _ = all_buf_indices[start]
+                ci, _, reward, done = self.memory.buffer[buf_idx]
+                self.memory.buffer[buf_idx] = (ci, n_step_return, reward, done)
+                self.memory.priorities[buf_idx] = max_pri
+                return_patches += 1
+
+            print(
+                f'[Unity] ep {ep_id}: {direct_penalties} direct penalties, '
+                f'{immediate_patches} immediate/backward patches, '
+                f'{return_patches} n-step returns recomputed, '
+                f'{stale_skips} stale slots skipped, '
+                f'total adjustment {adjustments.sum():.4f}'
+            )
+
+    def run(self, max_ep=1, verbose=False, train=None, unity_evaluator=None, unity_rewards=True, ep_offset=0):
         if train is None:
             train = self.__train
             
@@ -539,7 +674,7 @@ class Agent:
 
         for ep in iters:
             # === DRAIN COMPLETED UNITY RESULTS ===
-            if unity_evaluator is not None and train:
+            if unity_evaluator is not None and train and unity_rewards:
                 self.apply_unity_results(unity_evaluator)
 
             if verbose:
@@ -556,7 +691,7 @@ class Agent:
                 if verbose:
                     print(f'\nstep {step}')
                     
-                items, h_map, u_maps, actions = state
+                items, h_map, u_maps, boundary_maps, actions = state
                 if len(actions) == 0:
                     break
                 action, r, exploited = self.select(state)
@@ -588,7 +723,7 @@ class Agent:
                     history.append((compact_inputs, reward, done))
                 
                 if self.visualize:
-                    next_items, _, _, _ = next_state
+                    next_items, _, _, _, _ = next_state
                     if not os.path.exists(f'./outputs/bin{ep}/'):
                         os.makedirs(f'./outputs/bin{ep}/', exist_ok=True)
                     with open(f"./outputs/bin{ep}/conveyor.jsonl", "a") as f:
@@ -622,6 +757,11 @@ class Agent:
                             if hasattr(self.env, '_reward_breakdown'):
                                 entry['reward_breakdown'] = self.env._reward_breakdown
                             f.write(json.dumps(entry) + "\n")
+
+                    choice_record = self._placement_choice_record(step, state, reward)
+                    if choice_record is not None:
+                        with open(f"./outputs/bin{ep}/placementChoices.jsonl", "a") as f:
+                            f.write(json.dumps(choice_record) + "\n")
                     
                 ep_reward += reward
                 if done:
@@ -687,7 +827,7 @@ class HeuristicAgent:
     def select(self, state):
         # state = (items, h_map, u_maps, actions)
         
-        items, h_map, u_maps, actions = state
+        items, h_map, u_maps, boundary_maps, actions = state
 #         print(len(indices(actions)))
         action = self.heuristic(actions)
             
@@ -710,7 +850,7 @@ class HeuristicAgent:
                 if verbose:
                     print(f'\nstep {step}')
                     
-                items, h_map, u_maps, actions = state
+                items, h_map, u_maps, boundary_maps, actions = state
                 if len(actions) == 0:
                     break
                 

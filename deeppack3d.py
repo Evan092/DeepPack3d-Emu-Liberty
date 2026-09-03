@@ -61,6 +61,12 @@ def parse_args():
                         type=str, default=None, 
                         help='path to PackingSim_Linux.x86_64 for physics eval (default: None).')
     
+    parser.add_argument('--unity_level', metavar='', 
+                        type=int, default=2, choices=[0, 1, 2], 
+                        help='0: disable Unity entirely; 1: run Unity only on the final iteration '
+                             'for stability logging (no reward shaping); 2: run Unity every '
+                             'iteration and use its stability rewards (default: 2).')
+    
     return parser.parse_args()
 
 import numpy as np
@@ -76,7 +82,7 @@ heuristics = {
     'blsf': best_long_side_fit, 
 }
 
-def deeppack3d(method, lookahead, *, n_iterations=100, seed=None, verbose=1, data='generated', path=None, train=False, visualize=False, batch_size=32, unity_exe=None):
+def deeppack3d(method, lookahead, *, n_iterations=100, seed=None, verbose=1, data='generated', path=None, train=False, visualize=False, batch_size=32, unity_exe=None, unity_level=2):
     reset_rng(seed)
     
     env = MultiBinPackerEnv(n_bins=1, 
@@ -140,35 +146,50 @@ def deeppack3d(method, lookahead, *, n_iterations=100, seed=None, verbose=1, dat
             agent.eps = 0.025  # or load from a saved epsilon value
         else:
             agent.eps = 1.0
-        # Initialize Unity evaluator if exe path provided
+        # Initialize Unity evaluator if exe path provided and not disabled by level 0
         unity_evaluator = None
-        if unity_exe is not None:
+        unity_rewards = unity_level >= 2
+        if unity_exe is not None and unity_level > 0:
             unity_evaluator = UnityEvaluator(
                 exe_path=unity_exe,
                 placements_dir='./unity_sims',
                 max_parallel=6,
                 timeout=600,
-                reward_scale=100.0,
+                # Bounded near the env per-step reward scale so physics stays the
+                # dominant stability signal without swamping returns / diverging Q.
+                reward_scale=20.0,
             )
-            print(f'Unity physics eval enabled: {unity_exe}')
+            if unity_rewards:
+                print(f'Unity physics eval enabled (level 2, reward shaping on): {unity_exe}')
+            else:
+                print(f'Unity physics eval enabled (level 1, final iteration logging only): {unity_exe}')
+        elif unity_exe is not None:
+            print('Unity physics eval disabled (--unity_level=0)')
 
         # Initialize lists to store episode data
         episode_data = []
         iteration_data = []
         stability_data = []
         
+        last_iteration = n_iterations - 1
         for i in range(1, n_iterations):
             print(f'Iteration {i}')
             start_time = time.time()
             
-            yield from agent.run(100, verbose=verbose > 1, unity_evaluator=unity_evaluator, ep_offset=(i - 1) * 100)
+            # At level 1 Unity only runs on the final iteration, purely to log stability.
+            active_unity = unity_evaluator if (unity_rewards or i == last_iteration) else None
+            
+            yield from agent.run(100, verbose=verbose > 1, unity_evaluator=active_unity, unity_rewards=unity_rewards, ep_offset=(i - 1) * 100)
 
             # Wait for any Unity sims still running at the end of the iteration,
             # then apply their stability rewards to the replay buffer before logging.
-            if unity_evaluator is not None:
+            if active_unity is not None:
                 print(f'Waiting for remaining Unity sims...')
-                unity_evaluator.wait_all()
-                agent.apply_unity_results(unity_evaluator)
+                active_unity.wait_all()
+                if unity_rewards:
+                    agent.apply_unity_results(active_unity)
+                else:
+                    active_unity.drain()  # discard reward payloads, keep the log queue
 
             #agent.eps = max(agent.eps * 0.95, 0.025)
             agent.eps = max(agent.eps * 0.975, 0.025)
@@ -319,7 +340,8 @@ def main():
                         path=args.path,
                         visualize=args.visualize, 
                         batch_size=args.batch_size,
-                        unity_exe=args.unity):
+                        unity_exe=args.unity,
+                        unity_level=args.unity_level):
         pass
 
 if __name__ == "__main__":
