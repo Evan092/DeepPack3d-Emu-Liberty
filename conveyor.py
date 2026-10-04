@@ -26,9 +26,16 @@ class ItemGenerator:
 
 class FileConveyor(ItemGenerator):
     SCALE_DIVISOR = 20
+    BOX_ORDERS = ('lwh', 'whd')
 
-    def __init__(self, k=1, path='./input.txt'):
+    def __init__(self, k=1, path='./input.txt', box_order='lwh'):
         super().__init__(k)
+
+        if box_order not in self.BOX_ORDERS:
+            raise ValueError(f'box_order must be one of {self.BOX_ORDERS}, got {box_order!r}')
+        # 'lwh': length (x), width (z), height. 'whd': width (x), height, depth (z).
+        # The pallet header is always length (x), width (z), height.
+        self.box_order = box_order
 
         self.path = path
         
@@ -83,7 +90,10 @@ class FileConveyor(ItemGenerator):
             if not line:
                 continue
             parts = line.split()
-            w, h, d = map(float, parts[:3])
+            if self.box_order == 'lwh':
+                w, d, h = map(float, parts[:3])
+            else:
+                w, h, d = map(float, parts[:3])
 
             if self.scale is not None:
                 # Normalize to grid scale, minimum 1 to avoid zero-size items

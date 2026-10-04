@@ -32,6 +32,11 @@ def parse_args():
     parser.add_argument('--path', metavar='', 
                         type=str, default=None, 
                         help='set the file path, only used if --data is "file" (default: None).')
+
+    parser.add_argument('--box_order', metavar='',
+                        type=str, default='lwh', choices=['lwh', 'whd'],
+                        help='column order of box lines in --path: "lwh" (length width height) or "whd" '
+                             '(width height depth). The pallet header is always length width height (default: lwh).')
     
     parser.add_argument('--n_iterations', metavar='', 
                         type=int, default=100, 
@@ -48,6 +53,10 @@ def parse_args():
     parser.add_argument('--train', 
                         action='store_true', 
                         help='enable training mode, only used if method is "rl" (default: False).')
+
+    parser.add_argument('--resume',
+                        action='store_true',
+                        help='resume training from agent.h5 and agent_memory.pkl (default: False)')
     
     parser.add_argument('--batch_size', metavar='', 
                         type=int, default=32, 
@@ -63,9 +72,9 @@ def parse_args():
     
     parser.add_argument('--unity_level', metavar='', 
                         type=int, default=2, choices=[0, 1, 2], 
-                        help='0: disable Unity entirely; 1: run Unity only on the final iteration '
+                        help='0: disable Unity entirely; 1: run Unity only on the final greedy evaluation '
                              'for stability logging (no reward shaping); 2: run Unity every '
-                             'iteration and use its stability rewards (default: 2).')
+                             'iteration and use its stability rewards, plus the final evaluation (default: 2).')
     
     return parser.parse_args()
 
@@ -82,7 +91,7 @@ heuristics = {
     'blsf': best_long_side_fit, 
 }
 
-def deeppack3d(method, lookahead, *, n_iterations=100, seed=None, verbose=1, data='generated', path=None, train=False, visualize=False, batch_size=32, unity_exe=None, unity_level=2):
+def deeppack3d(method, lookahead, *, n_iterations=100, seed=None, verbose=1, data='generated', path=None, box_order='lwh', train=False, resume=False, visualize=False, batch_size=32, unity_exe=None, unity_level=2):
     reset_rng(seed)
     
     env = MultiBinPackerEnv(n_bins=1, 
@@ -93,7 +102,7 @@ def deeppack3d(method, lookahead, *, n_iterations=100, seed=None, verbose=1, dat
                             verbose=verbose)
 
     if data == 'file':
-        file_conveyor = FileConveyor(k=env.k, path=path)
+        file_conveyor = FileConveyor(k=env.k, path=path, box_order=box_order)
         env.conveyor = file_conveyor.reset()
         # If the file specifies a pallet size, rescale the env to match
         if file_conveyor.bin_size is not None:
@@ -104,7 +113,8 @@ def deeppack3d(method, lookahead, *, n_iterations=100, seed=None, verbose=1, dat
             W, H, D = env.size
             env.v_pad_headroom = (H + 1) * env.v_pad
             env.packers = [SpacePartitioner(env.size, floor_height=env.v_pad,
-                                            v_pad_headroom=env.v_pad_headroom)
+                                            v_pad_headroom=env.v_pad_headroom,
+                                            h_pad_headroom=env.h_pad)
                            for _ in range(env.n_bins)]
             if verbose > 0:
                 print(f'Pallet {file_conveyor.pallet_size} \u2192 '
@@ -131,21 +141,20 @@ def deeppack3d(method, lookahead, *, n_iterations=100, seed=None, verbose=1, dat
         model_path = f'./agent.h5'
         memory_path = model_path.replace('.h5', '_memory.pkl')
         agent = Agent(env, train=True, verbose=verbose > 0, visualize=visualize, batch_size=batch_size)
-        # Load pre-trained model into both networks if it exists
-        if os.path.exists(model_path):
+        if resume and not os.path.exists(model_path):
+            raise FileNotFoundError(f'Cannot resume: model not found at {model_path}')
+
+        if resume:
             agent.q_net = tf.keras.models.load_model(model_path, compile=False, custom_objects={'Dense': CompatibleDense, 'CompatibleDense': CompatibleDense})
             agent.q_net_target = tf.keras.models.load_model(model_path, compile=False, custom_objects={'Dense': CompatibleDense, 'CompatibleDense': CompatibleDense})
-            agent.q_net.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4), loss='mse')
+            agent.warmup_lr = 1e-4
+            agent.learning_rate = 1e-4
+            agent.q_optimizer.learning_rate.assign(agent.warmup_lr)
 
             if os.path.exists(memory_path) and True:
                 agent.load_memory(memory_path)
 
-        agent.eps = 1.0
-        if os.path.exists(model_path):
-            # ... load model ...
-            agent.eps = 0.025  # or load from a saved epsilon value
-        else:
-            agent.eps = 1.0
+        agent.eps = 0.025 if resume else 1.0
         # Initialize Unity evaluator if exe path provided and not disabled by level 0
         unity_evaluator = None
         unity_rewards = unity_level >= 2
@@ -157,12 +166,12 @@ def deeppack3d(method, lookahead, *, n_iterations=100, seed=None, verbose=1, dat
                 timeout=600,
                 # Bounded near the env per-step reward scale so physics stays the
                 # dominant stability signal without swamping returns / diverging Q.
-                reward_scale=20.0,
+                reward_scale=10.0,
             )
             if unity_rewards:
                 print(f'Unity physics eval enabled (level 2, reward shaping on): {unity_exe}')
             else:
-                print(f'Unity physics eval enabled (level 1, final iteration logging only): {unity_exe}')
+                print(f'Unity physics eval enabled (level 1, final evaluation logging only): {unity_exe}')
         elif unity_exe is not None:
             print('Unity physics eval disabled (--unity_level=0)')
 
@@ -170,35 +179,14 @@ def deeppack3d(method, lookahead, *, n_iterations=100, seed=None, verbose=1, dat
         episode_data = []
         iteration_data = []
         stability_data = []
-        
-        last_iteration = n_iterations - 1
-        for i in range(1, n_iterations):
-            print(f'Iteration {i}')
-            start_time = time.time()
-            
-            # At level 1 Unity only runs on the final iteration, purely to log stability.
-            active_unity = unity_evaluator if (unity_rewards or i == last_iteration) else None
-            
-            yield from agent.run(100, verbose=verbose > 1, unity_evaluator=active_unity, unity_rewards=unity_rewards, ep_offset=(i - 1) * 100)
 
-            # Wait for any Unity sims still running at the end of the iteration,
-            # then apply their stability rewards to the replay buffer before logging.
-            if active_unity is not None:
-                print(f'Waiting for remaining Unity sims...')
-                active_unity.wait_all()
-                if unity_rewards:
-                    agent.apply_unity_results(active_unity)
-                else:
-                    active_unity.drain()  # discard reward payloads, keep the log queue
-
-            #agent.eps = max(agent.eps * 0.95, 0.025)
-            agent.eps = max(agent.eps * 0.975, 0.025)
-            
-            # Log episode data for this iteration
-            for ep_idx, (utils, n_bins, ep_reward, items_packed) in enumerate(agent.ep_history[-100:]):
+        def log_block(label):
+            """Log the last 100 episodes and any Unity results drained so far under iteration `label`."""
+            recent_episodes = agent.ep_history[-100:]
+            for ep_idx, (utils, n_bins, ep_reward, items_packed) in enumerate(recent_episodes):
                 for bin_idx, util in enumerate(utils):
                     episode_data.append({
-                        'iteration': i,
+                        'iteration': label,
                         'episode': ep_idx,
                         'bin': bin_idx,
                         'util_percent': util * 100,
@@ -206,28 +194,32 @@ def deeppack3d(method, lookahead, *, n_iterations=100, seed=None, verbose=1, dat
                         'reward': ep_reward,
                         'n_bins': n_bins
                     })
-            
-            # Collect any Unity stability results that finished this iteration
+
+            stability_scores = []
             if unity_evaluator is not None:
-                for ep_id, unity_reward in unity_evaluator.drain_log():
-                    stability_score = (unity_reward / unity_evaluator.reward_scale) + 0.8
+                for ep_id, unity_reward, succeeded in unity_evaluator.drain_log():
+                    stability_score = (
+                        (unity_reward / unity_evaluator.reward_scale) + 0.8
+                        if succeeded
+                        else None
+                    )
+                    if succeeded:
+                        stability_scores.append(stability_score)
                     stability_data.append({
-                        'iteration': ep_id // 100 + 1,
+                        'iteration': label,
                         'episode': ep_id % 100,
                         'global_episode': ep_id,
-                        'unity_reward': round(unity_reward, 4),
-                        'stability_score': round(stability_score, 4),
+                        'unity_succeeded': succeeded,
+                        'unity_reward': round(unity_reward, 4) if succeeded else None,
+                        'stability_score': round(stability_score, 4) if succeeded else None,
                     })
 
-            # Calculate iteration averages
-            recent_episodes = agent.ep_history[-100:]
             utils_flat = [util for utils, n_bins, ep_reward, items_packed in recent_episodes for util in utils]
             items_packed_list = [items_packed for utils, n_bins, ep_reward, items_packed in recent_episodes]
-            
             rewards_list = [ep_reward for utils, n_bins, ep_reward, items_packed in recent_episodes]
 
             iteration_data.append({
-                'iteration': i,
+                'iteration': label,
                 'mean_util': np.mean(utils_flat),
                 'min_util': np.min(utils_flat),
                 'max_util': np.max(utils_flat),
@@ -237,23 +229,41 @@ def deeppack3d(method, lookahead, *, n_iterations=100, seed=None, verbose=1, dat
                 'mean_reward': np.mean(rewards_list),
                 'min_reward': np.min(rewards_list),
                 'max_reward': np.max(rewards_list),
+                'mean_stability': np.mean(stability_scores) if stability_scores else None,
             })
+            return utils_flat, items_packed_list
+
+        def save_logs():
+            pd.DataFrame(episode_data).to_excel('./training_episodes.xlsx', index=False)
+            pd.DataFrame(iteration_data).to_excel('./training_iterations.xlsx', index=False)
+            if stability_data:
+                pd.DataFrame(stability_data).to_excel('./training_stability.xlsx', index=False)
+        
+        last_iteration = n_iterations - 1
+        for i in range(1, n_iterations):
+            print(f'Iteration {i}')
+            start_time = time.time()
+            
+            # Unity only runs during training at level 2, where its stability rewards are used.
+            active_unity = unity_evaluator if unity_rewards else None
+            
+            yield from agent.run(100, verbose=verbose > 1, unity_evaluator=active_unity, unity_rewards=unity_rewards, ep_offset=(i - 1) * 100)
+
+            # Wait for any Unity sims still running at the end of the iteration,
+            # then apply their stability rewards to the replay buffer before logging.
+            if active_unity is not None:
+                print(f'Waiting for remaining Unity sims...')
+                active_unity.wait_all()
+                agent.apply_unity_results(active_unity)
+
+            #agent.eps = max(agent.eps * 0.95, 0.025)
+            agent.eps = max(agent.eps * 0.975, 0.025)
+            
+            utils_flat, items_packed_list = log_block(i)
             
             # Save data every 10 iterations or on last iteration
             if (i + 1) % 10 == 0 or i == n_iterations - 1:
-                # Save episode data
-                episodes_df = pd.DataFrame(episode_data)
-                episodes_df.to_excel('./training_episodes.xlsx', index=False)
-                
-                # Save iteration data
-                iterations_df = pd.DataFrame(iteration_data)
-                iterations_df.to_excel('./training_iterations.xlsx', index=False)
-
-                # Save Unity stability data
-                if stability_data:
-                    stability_df = pd.DataFrame(stability_data)
-                    stability_df.to_excel('./training_stability.xlsx', index=False)
-                
+                save_logs()
                 print(f'Data saved after iteration {i}')
             
             # Save model and memory after each iteration
@@ -265,6 +275,19 @@ def deeppack3d(method, lookahead, *, n_iterations=100, seed=None, verbose=1, dat
                 agent.save_memory(memory_path)
             
             print(f'Iteration {i} completed in {time.time() - start_time:.2f} seconds, Avg Util: {np.mean(utils_flat)*100:.2f}%, Avg Items: {np.mean(items_packed_list):.2f}')
+
+        # Final greedy evaluation of the trained policy (no exploration, no training), logged as iteration 'eval'
+        print('Final evaluation (greedy, no training)...')
+        start_time = time.time()
+        agent.eps = 0.0
+        yield from agent.run(100, verbose=verbose > 1, train=False, unity_evaluator=unity_evaluator, unity_rewards=False, ep_offset=last_iteration * 100)
+        if unity_evaluator is not None:
+            print('Waiting for evaluation Unity sims...')
+            unity_evaluator.wait_all()
+            unity_evaluator.drain()  # evaluation results are logged, never applied to replay
+        utils_flat, items_packed_list = log_block('eval')
+        save_logs()
+        print(f'Evaluation completed in {time.time() - start_time:.2f} seconds, Avg Util: {np.mean(utils_flat)*100:.2f}%, Avg Items: {np.mean(items_packed_list):.2f}')
             
         if unity_evaluator is not None:
             unity_evaluator.shutdown(wait=True)
@@ -335,9 +358,11 @@ def main():
                         n_iterations=args.n_iterations, 
                         seed=args.seed, 
                         train=args.train, 
+                        resume=args.resume,
                         verbose=args.verbose, 
                         data=args.data, 
                         path=args.path,
+                        box_order=args.box_order,
                         visualize=args.visualize, 
                         batch_size=args.batch_size,
                         unity_exe=args.unity,

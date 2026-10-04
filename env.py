@@ -30,19 +30,37 @@ def indices(actions):
         for k in range(len(actions[i][j]))
     ]
 
+def dead_space(a_map, rows, cols, min_dim, pad):
+    """Volume of pits along the given rows/columns that are wider than the padding gap but too narrow to fill."""
+    dead = 0.0
+    for line in [a_map[r] for r in rows] + [a_map[:, c] for c in cols]:
+        n = line.size
+        edges = np.flatnonzero(np.diff(line)) + 1
+        for s, e in zip(np.r_[0, edges], np.r_[edges, n]):
+            # A pit is a flat run lower than both neighbours; the pallet edge counts as a wall
+            rim = min(line[s - 1] if s > 0 else np.inf, line[e] if e < n else np.inf)
+            # Between two boxes the left box's clearance is inside the run, plus the new box's own clearance
+            need = min_dim + pad * (2 if 0 < s and e < n else 1)
+            if np.isfinite(rim) and rim > line[s] and pad < e - s < need:
+                dead += (e - s) * (rim - line[s])
+    return dead
+
 class MultiBinPackerEnv(Env):
-    def __init__(self, n_bins, size, k=1, max_bins=None, max_items=None, replace='all', verbose=False, prealloc_bins=0, prealloc_items=0, shuffle=False, use_rotate=True, use_skip=True, h_pad=0.5, v_pad=0.5):
+    def __init__(self, n_bins, size, k=1, max_bins=None, max_items=None, replace='all', verbose=False, prealloc_bins=0, prealloc_items=0, shuffle=False, use_rotate=True, use_skip=True, h_pad=1, v_pad=0.5, min_support=0.5):
         super().__init__(verbose)
         self.n_bins = n_bins
         self.size = size
         self.k = k
         
         # Padding configuration
-        # h_pad: horizontal padding (x, z) between boxes. realistic for real-world replication
+        # h_pad: horizontal padding (x, z) between boxes, in whole grid cells. realistic for real-world replication
         # v_pad: vertical padding (y) between stacked boxes and below first layer. minimal for physics sim
         # v_pad does NOT count against bin height: items "fall" into place in the real world
         self.h_pad = h_pad
         self.v_pad = v_pad
+
+        # Minimum fraction of a box's footprint that must rest at its physical support height
+        self.min_support = min_support
         
         # Scale factor for converting grid coords back to real-world units
         # Default 1.0, overridden when loading from file
@@ -51,7 +69,7 @@ class MultiBinPackerEnv(Env):
         W, H, D = size
         self.v_pad_headroom = (H + 1) * v_pad
         
-        self.packers = [SpacePartitioner(size, floor_height=v_pad, v_pad_headroom=self.v_pad_headroom) for _ in range(n_bins)]
+        self.packers = [SpacePartitioner(size, floor_height=v_pad, v_pad_headroom=self.v_pad_headroom, h_pad_headroom=h_pad) for _ in range(n_bins)]
         self.conveyor = Conveyor(k, 
                                  max_items=max_items, 
                                  prealloc_bins=prealloc_bins, 
@@ -80,6 +98,10 @@ class MultiBinPackerEnv(Env):
         self.item_counter = 0
         # History of interweave calculations for debugging/analysis
         self._interweave_log = []
+        # Per placement: {placement index of a supporting box: share of the load-bearing area}
+        self.placement_supporters = []
+        # Per bin: last value of each state-quality potential, for potential-based shaping
+        self._potentials = [{} for _ in range(n_bins)]
         
     def reset(self):
         for packer in self.packers:
@@ -95,7 +117,14 @@ class MultiBinPackerEnv(Env):
         self.id_maps = [np.full((self.size[2], self.size[0]), -1, dtype=np.int32) for _ in range(self.n_bins)]
         self.item_counter = 0
         self._interweave_log = []
+        self.placement_supporters = []
+        self._potentials = [{} for _ in range(self.n_bins)]
         return self.state()
+
+    def release_height(self, j, x, z, w, d):
+        """Height to release a box from for physics: one v_pad above where it will physically rest."""
+        footprint = self.packers[j].actual_height_map[int(z):int(z + d), int(x):int(x + w)]
+        return float(np.max(footprint)) + self.v_pad
     
     @staticmethod
     def _random_item_color():
@@ -259,28 +288,18 @@ class MultiBinPackerEnv(Env):
             sx, sy, sz = split.coord
             sw, sd = split.width, split.depth
             
-            # Using a tuple instead of a list avoids memory allocation overhead per loop
-            split_candidates = (
-                (sx, sz),                                      
-                (sx + sw - w_pad, sz),                         
-                (sx, sz + sd - d_pad),                         
-                (sx + sw - w_pad, sz + sd - d_pad)             
-            )
-            
-            for cx, cz in split_candidates:
-                # math.ceil is significantly faster on scalars than np.ceil
-                x, z = int(math.ceil(cx)), int(math.ceil(cz))
-                
-                if 0 <= x and 0 <= z and x + w_pad <= self.size[0] and z + d_pad <= self.size[2]:
-                    if (x, z) not in splits:
-                        splits[(x, z)] = split
+            # Near corners round up and far corners round down so snapping never pushes a box out of its split
+            for x in (math.ceil(sx), math.floor(sx + sw - w_pad)):
+                for z in (math.ceil(sz), math.floor(sz + sd - d_pad)):
+                    # Only the physical box must be on the pallet; its clearance may hang past the edge
+                    if 0 <= x and 0 <= z and x + w <= self.size[0] and z + d <= self.size[2]:
+                        splits.setdefault((x, z), split)
         
         for placed in packer.actual_splits:
             for cx in (int(placed.x), int(placed.right)):
                 for cz in (int(placed.z), int(placed.front)):
-                    if cx + w_pad <= self.size[0] and cz + d_pad <= self.size[2]:
-                        if (cx, cz) not in splits:
-                            splits[(cx, cz)] = None
+                    if cx + w <= self.size[0] and cz + d <= self.size[2]:
+                        splits.setdefault((cx, cz), None)
 
         xyz = []
         
@@ -293,11 +312,13 @@ class MultiBinPackerEnv(Env):
             if actual_y + h > self.size[1]:
                 continue
                 
-            # 2. CHEAP CHECK: Does it meet the 50% stability threshold?
+            # 2. CHEAP CHECK: Is enough of the footprint resting at the physical support height?
+            # Padded heights drift 0.5 per layer, so they can't be used to judge support
+            if np.count_nonzero(actual_placement == actual_y) / base_area < self.min_support:
+                continue
+
             placement = h_map[z:z + d, x:x + w]
             y = np.amax(placement)
-            if np.count_nonzero(placement == y) / base_area <= 0.5:
-                continue
 
             # 3. EXPENSIVE CHECK: Does the padded 3D cuboid collide with anything?
             padded_cuboid = Cuboid(x, y, z, w_pad, h_pad, d_pad)
@@ -358,10 +379,12 @@ class MultiBinPackerEnv(Env):
             i, j, k = action
             _, (x, y, z), (w, h, d), _ = actions[i][j][k]
             
-            # Capture height map BEFORE placing the item for overhang calculation
-            old_h_map = h_maps[j].copy()
-            
             packer = self.packers[j]
+
+            # Physical heights BEFORE placing the item; reward terms never compare padded heights
+            old_a_map = packer.actual_height_map.copy()
+            rest_y = float(np.max(old_a_map[z:z + d, x:x + w]))
+
             actual_cuboid = Cuboid(x, y, z, w, h, d)
             padded_cuboid = Cuboid(x, y, z, w + self.h_pad, h + self.v_pad, d + self.h_pad)
             item_color = self._item_colors.pop(i) if i < len(self._item_colors) else None
@@ -392,7 +415,7 @@ class MultiBinPackerEnv(Env):
             # sits on the floor, there is no interweaving benefit.
             if z1 <= z0 or x1 <= x0:
                 interweave_score = 0.0
-            elif y <= self.v_pad:
+            elif rest_y <= 0:
                 interweave_score = 0.0 # Floor placements don't bridge seams
             else:
                 support_ids = id_map[z0:z1, x0:x1]
@@ -400,8 +423,8 @@ class MultiBinPackerEnv(Env):
                 # Without this check, a footprint spanning multiple ids at very
                 # different (lower) heights would still score as "bridging",
                 # rewarding overhangs instead of genuine seam bridging.
-                support_heights = old_h_map[z0:z1, x0:x1]
-                load_bearing_mask = np.isclose(support_heights, y, atol=0.5)
+                support_heights = old_a_map[z0:z1, x0:x1]
+                load_bearing_mask = np.isclose(support_heights, rest_y)
                 valid_mask = (support_ids >= 0) & load_bearing_mask
                 if np.any(valid_mask):
                     unique_ids = np.unique(support_ids[valid_mask])
@@ -451,6 +474,16 @@ class MultiBinPackerEnv(Env):
             if self.verbose:
                 print('Interweave:', record)
 
+            # Boxes this placement rests on, weighted by load-bearing area, so Unity can blame weak foundations
+            supporters = {}
+            if rest_y > 0:
+                bearing_ids = id_map[z0:z1, x0:x1][np.isclose(old_a_map[z0:z1, x0:x1], rest_y)]
+                bearing_ids = bearing_ids[bearing_ids >= 0]
+                if bearing_ids.size:
+                    ids, areas = np.unique(bearing_ids, return_counts=True)
+                    supporters = {int(s): float(a) / bearing_ids.size for s, a in zip(ids, areas)}
+            self.placement_supporters.append(supporters)
+
             # Vectorized boundary-map update: clear the old footprint, then draw the new inner border
             boundary_map[z0:z1, x0:x1] = 0.0
             if z1 - z0 > 0 and x1 - x0 > 0:
@@ -471,7 +504,6 @@ class MultiBinPackerEnv(Env):
             items, h_maps, u_maps, boundary_maps_state, actions = next_state
             
             item = items[i]
-            h_map = h_maps[j]
             volume = np.sum([split.volume for split in packer.actual_splits])
 
             # === REWARD COMPONENTS ===
@@ -527,30 +559,22 @@ class MultiBinPackerEnv(Env):
             nx_start = max(0, int(x) - neighborhood_radius)
             nx_end = min(W, int(x + w) + neighborhood_radius)
             
-            neighborhood = old_h_map[nz_start:nz_end, nx_start:nx_end]
+            neighborhood = old_a_map[nz_start:nz_end, nx_start:nx_end]
             
             if neighborhood.size > 0 and np.max(neighborhood) > 0:
-                gap_score = (np.mean(neighborhood) - y) / (np.max(old_h_map) + 1e-9)
+                gap_score = (np.mean(neighborhood) - rest_y) / (np.max(old_a_map) + 1e-9)
                 gap_fill = max(0.0, min(1.0, gap_score + 0.5))
             else:
                 gap_fill = 0.5
 
-            # 4b. Gap Creation Penalty
-            def measure_gap_severity(hmap_region):
-                if hmap_region.size == 0 or np.max(hmap_region) == 0:
-                    return 0.0
-                local_max = np.max(hmap_region)
-                return np.sum(local_max - hmap_region) / (hmap_region.size * local_max + 1e-9)
-            
-            gap_radius = max(w, d) + 1
-            gz_start = max(0, int(z) - gap_radius)
-            gz_end = min(D, int(z + d) + gap_radius)
-            gx_start = max(0, int(x) - gap_radius)
-            gx_end = min(W, int(x + w) + gap_radius)
-            
-            old_gap_severity = measure_gap_severity(old_h_map[gz_start:gz_end, gx_start:gx_end])
-            new_gap_severity = measure_gap_severity(h_map[gz_start:gz_end, gx_start:gx_end])
-            gap_creation_penalty = max(0.0, new_gap_severity - old_gap_severity)
+            # 4b. Gap Creation Penalty: dead space newly trapped in pits too narrow for any visible item.
+            # Only the rows and columns through the footprint can change, so only those are measured.
+            footprint_dims = [min(itm[0], itm[2]) for itm in items if itm is not None]
+            min_dim = min(footprint_dims) if footprint_dims else min(w, d)
+            rows, cols = range(z, z + d), range(x, x + w)
+            created = (dead_space(actual_h_map, rows, cols, min_dim, self.h_pad)
+                       - dead_space(old_a_map, rows, cols, min_dim, self.h_pad))
+            gap_creation_penalty = min(1.0, max(0.0, created) / (w * h * d))
 
             # 5. Same-Height Adjacency
             x_int, z_int = int(x), int(z)
@@ -563,14 +587,14 @@ class MultiBinPackerEnv(Env):
             n_z_start = max(0, z_int - search_radius)
             n_z_end = min(D, z_int + d_int + search_radius)
 
-            neighborhood_adj = old_h_map[n_z_start:n_z_end, n_x_start:n_x_end]
+            neighborhood_adj = old_a_map[n_z_start:n_z_end, n_x_start:n_x_end]
 
             exclude_self = np.ones(neighborhood_adj.shape, dtype=bool)
             rel_z = z_int - n_z_start
             rel_x = x_int - n_x_start
             exclude_self[rel_z:rel_z + d_int, rel_x:rel_x + w_int] = False
 
-            same_height = (np.abs(neighborhood_adj - actual_placed_top) <= 0.5) & (neighborhood_adj > self.v_pad) & exclude_self
+            same_height = (np.abs(neighborhood_adj - actual_placed_top) <= 0.5) & (neighborhood_adj > 0) & exclude_self
             total_neighbor_cells = int(np.sum(exclude_self))
 
             if total_neighbor_cells > 0:
@@ -581,13 +605,13 @@ class MultiBinPackerEnv(Env):
             # Note: Section 6 (Interweaving) is executed at the top of the function to capture old IDs.
 
             # 7. Support IoU
-            if y <= self.v_pad:
+            if rest_y <= 0:
                 support_iou = 1.0
             else:
-                footprint = old_h_map[int(z):int(z + d), int(x):int(x + w)]
+                footprint = old_a_map[int(z):int(z + d), int(x):int(x + w)]
                 total_cells = w * d
                 if total_cells > 0:
-                    supported_cells = np.sum(np.isclose(footprint, y, atol=0.5))
+                    supported_cells = np.sum(np.isclose(footprint, rest_y))
                     support_fraction = supported_cells / total_cells
                     overhang_score = support_fraction ** 2
                     
@@ -596,19 +620,19 @@ class MultiBinPackerEnv(Env):
                     sx_end = min(W, int(x + w) + expand)
                     sz_start = max(0, int(z) - expand)
                     sz_end = min(D, int(z + d) + expand)
-                    support_region_old = old_h_map[sz_start:sz_end, sx_start:sx_end]
-                    platform_mask = np.isclose(support_region_old, y, atol=0.5)
+                    support_region_old = old_a_map[sz_start:sz_end, sx_start:sx_end]
+                    platform_mask = np.isclose(support_region_old, rest_y)
                     platform_cells = np.sum(platform_mask)
                     
                     if platform_cells > 0:
-                        support_region_new = h_map[sz_start:sz_end, sx_start:sx_end]
-                        covered = np.sum((support_region_new > y + 0.1) & platform_mask)
+                        support_region_new = actual_h_map[sz_start:sz_end, sx_start:sx_end]
+                        covered = np.sum((support_region_new > rest_y + 0.1) & platform_mask)
                         surface_utilization = covered / platform_cells
                     else:
                         surface_utilization = 0.0
                     
                     support_iou = 0.7 * overhang_score + 0.3 * surface_utilization
-                    height_decay = 1.0 - 0.5 * (y / (H + 1e-9))
+                    height_decay = 1.0 - 0.5 * (rest_y / (H + 1e-9))
                     support_iou *= max(height_decay, 0.4)
                 else:
                     support_iou = 0.0
@@ -624,7 +648,7 @@ class MultiBinPackerEnv(Env):
             max_visible_volume = max(conveyor_volumes) if conveyor_volumes else item_volume
             max_visible_volume = max(max_visible_volume, item_volume)
             volume_fraction = item_volume / (max_visible_volume + 1e-9)
-            height_fraction = y / (H + 1e-9)
+            height_fraction = rest_y / (H + 1e-9)
             big_bottom = (1.0 - height_fraction) * volume_fraction
 
             # === Layer Completion ===
@@ -637,7 +661,7 @@ class MultiBinPackerEnv(Env):
                 layer_completion = 0.0
 
             # Height Penalty
-            height_penalty = (y / (H + 1e-9)) ** 2
+            height_penalty = (rest_y / (H + 1e-9)) ** 2
 
             # === DYNAMIC SCHEDULER ===
             progress = min(self.items_in_current_bin / 50.0, 1.0)
@@ -649,54 +673,18 @@ class MultiBinPackerEnv(Env):
             gapScale = 0.7 * (1.0 - progress) + 1.5 * progress
             gapCreationScale = 2.0 * (1.0 - progress) + 3.0 * progress
             adjacencyScale = 2
-            interweaveScale = 1.2 * (1.0 - progress) + 1.8 * progress
+            interweaveScale = 0.0
             supportScale = 0.5 * (1.0 - progress) + 2.0 * progress
             coverageScale = 6.0 * (1.0 - progress) + 3.0 * progress
             bigBottomScale = 3.0 * (1.0 - progress) + 0.5 * progress
             layerScale = 3.0 * (1.0 - progress) + 2.0 * progress
             heightPenaltyScale = 3.0 * (1.0 - progress) + 12.0 * progress
-
-            positive_scale_sum = (flatnessScale + stackScale + centerScale + volumeScale
-                                + gapScale + adjacencyScale + interweaveScale + supportScale
-                                + coverageScale + bigBottomScale + layerScale)
-            baseline = 0.2 * positive_scale_sum
-
-            reward = (flatnessScale * surface_flatness
-                    + stackScale * stackability
-                    + centerScale * center_proximity 
-                    + volumeScale * volume_efficiency 
-                    + gapScale * gap_fill
-                    - gapCreationScale * gap_creation_penalty
-                    + adjacencyScale * adjacency
-                    + interweaveScale * interweave_score  # Now driven purely by our seam bridging logic
-                    + supportScale * support_iou
-                    + coverageScale * footprint_coverage
-                    + bigBottomScale * big_bottom
-                    + layerScale * layer_completion
-                    - heightPenaltyScale * height_penalty
-                    - baseline)
-
-            self._reward_breakdown = {
-                'flatness': round(float(flatnessScale * surface_flatness), 4),
-                'stackability': round(float(stackScale * stackability), 4),
-                'center': round(float(centerScale * center_proximity), 4),
-                'volume_eff': round(float(volumeScale * volume_efficiency), 4),
-                'gap_fill': round(float(gapScale * gap_fill), 4),
-                'gap_penalty': round(float(-gapCreationScale * gap_creation_penalty), 4),
-                'adjacency': round(float(adjacencyScale * adjacency), 4),
-                'interweaving': round(float(interweaveScale * interweave_score), 4),
-                'support_iou': round(float(supportScale * support_iou), 4),
-                'coverage': round(float(coverageScale * footprint_coverage), 4),
-                'big_bottom': round(float(bigBottomScale * big_bottom), 4),
-                'layer_completion': round(float(layerScale * layer_completion), 4),
-                'height_penalty': round(float(-heightPenaltyScale * height_penalty), 4),
-                'baseline': round(float(-baseline), 4),
-                'overhang_penalty': 0.0,
-            }
+            packScale = 100.0
 
             # Overhang Additive Penalty
-            if y > self.v_pad:
-                support_mask = (old_h_map[int(z):int(z + d), int(x):int(x + w)] == y).astype(float)
+            overhang_additive = 0.0
+            if rest_y > 0:
+                support_mask = np.isclose(old_a_map[int(z):int(z + d), int(x):int(x + w)], rest_y).astype(float)
                 support_area = np.sum(support_mask)
                 total_item_area = w * d
                 
@@ -724,8 +712,43 @@ class MultiBinPackerEnv(Env):
                     
                     overhang_scale = 3.0 * (1.0 - progress) + 6.0 * progress
                     overhang_additive = overhang_scale * sig * asymmetry_amp * foundation_amp
-                    reward -= overhang_additive
-                    self._reward_breakdown['overhang_penalty'] = round(float(-overhang_additive), 4)
+
+            # State-quality terms are paid as changes in a potential, so over an episode they telescope
+            # and can't make ending it early worth more than packing another box
+            potentials = {
+                'flatness': flatnessScale * surface_flatness,
+                'stackability': stackScale * stackability,
+                'center': centerScale * center_proximity,
+                'volume_eff': volumeScale * volume_efficiency,
+                'coverage': coverageScale * footprint_coverage,
+                'layer_completion': layerScale * layer_completion,
+            }
+            shaping = {key: value - self._potentials[j].get(key, 0.0) for key, value in potentials.items()}
+            self._potentials[j] = potentials
+
+            credits = {
+                'packing': packScale * item_volume / (W * H * D),
+                'gap_fill': gapScale * gap_fill,
+                'adjacency': adjacencyScale * adjacency,
+                'interweaving': interweaveScale * interweave_score,
+                'support_iou': supportScale * support_iou,
+                'big_bottom': bigBottomScale * big_bottom,
+            }
+            penalties = {
+                'gap_penalty': gapCreationScale * gap_creation_penalty,
+                'height_penalty': heightPenaltyScale * height_penalty,
+                'overhang_penalty': overhang_additive,
+            }
+            # Penalties may cut a placement's credit by at most 90%, so every legal placement is worth packing
+            credit_total = sum(credits.values())
+            penalty_total = sum(penalties.values())
+            penalty_cap = max(0.0, penalty_total - 0.9 * credit_total)
+
+            reward = credit_total - penalty_total + penalty_cap + sum(shaping.values())
+
+            self._reward_breakdown = {key: round(float(value), 4) for key, value in {**shaping, **credits}.items()}
+            self._reward_breakdown.update({key: round(float(-value), 4) for key, value in penalties.items()})
+            self._reward_breakdown['penalty_cap'] = round(float(penalty_cap), 4)
                     
             done = len(indices(actions)) == 0
             
@@ -742,8 +765,9 @@ class MultiBinPackerEnv(Env):
                         loc = np.argmax([packer.space_utilization() for packer in self.packers])
                         packer = self.packers[loc]
                         self.used_packers.append(self.packers[loc])
-                        self.packers[loc] = SpacePartitioner(self.size, floor_height=self.v_pad, v_pad_headroom=self.v_pad_headroom)
+                        self.packers[loc] = SpacePartitioner(self.size, floor_height=self.v_pad, v_pad_headroom=self.v_pad_headroom, h_pad_headroom=self.h_pad)
                         self.packers[loc].reset()
+                        self._potentials[loc] = {}
                         
                         # FIX: Prevent the state leak by clearing the new bin's maps
                         self.boundary_maps[loc].fill(0.0)
@@ -764,8 +788,9 @@ class MultiBinPackerEnv(Env):
                                 break
 
                             self.used_packers.append(self.packers[loc])
-                            self.packers[loc] = SpacePartitioner(self.size, floor_height=self.v_pad, v_pad_headroom=self.v_pad_headroom)
+                            self.packers[loc] = SpacePartitioner(self.size, floor_height=self.v_pad, v_pad_headroom=self.v_pad_headroom, h_pad_headroom=self.h_pad)
                             self.packers[loc].reset()
+                            self._potentials[loc] = {}
                             
                             # FIX: Prevent the state leak by clearing the new bin's maps
                             self.boundary_maps[loc].fill(0.0)

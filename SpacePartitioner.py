@@ -121,11 +121,12 @@ def render(size, spaces, colors, conveyor_items=None, conveyor_colors=None):
     return r.show()
     
 class SpacePartitioner:
-    def __init__(self, size, floor_height=0, v_pad_headroom=0):
+    def __init__(self, size, floor_height=0, v_pad_headroom=0, h_pad_headroom=0):
         self.size = size 
         self.floor_height = floor_height
         w, h, d = size
-        self.internal_size = (w, h + v_pad_headroom, d)
+        # Horizontal headroom lets a box's clearance hang past the pallet edge so boxes can sit flush with it
+        self.internal_size = (w + h_pad_headroom, h + v_pad_headroom, d + h_pad_headroom)
         self.reset()
         self._colors = {}
         

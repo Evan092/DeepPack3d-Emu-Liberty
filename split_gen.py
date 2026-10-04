@@ -8,7 +8,7 @@ rng = None
 
 def reset_rng(seed=None):
     global rng
-    np.random.seed(seed=None)
+    np.random.seed(seed)
     rng = np.random.default_rng(seed=seed)
     
 reset_rng()
